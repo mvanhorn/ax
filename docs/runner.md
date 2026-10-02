@@ -23,7 +23,21 @@ The control plane does not run `spec.command` as the container entrypoint. It al
 
 Two consequences follow from that table. Your image must contain an executable at `/usr/local/bin/ax-task-runner`, even if it is a symlink or a shell wrapper around something else. And `spec.command` reaches the runner only through `AX_TASK_YAML`; the runner is responsible for parsing it and starting it.
 
-The `/workspace` volume is what survives suspend and resume. Agent Substrate snapshots it when a task is suspended and restores it into a fresh container when the task is resumed, so the runner will see the same files but a new process tree.
+The `/workspace` volume is the durable data that survives suspend and resume. Agent Substrate snapshots that data when a task is suspended. A resume restores the golden snapshot's process state together with those files. The processes that come back are the ones captured for the template, which is separate from a process restart: a restart, such as a cold boot, runs the runner again from the image. See [Golden boot](#golden-boot).
+
+### Golden boot
+
+Creating an actor template boots its container so Agent Substrate can capture a golden snapshot of the prepared guest. That boot is template preparation. Seeing the runner start is not evidence that a task actor has resumed.
+
+The template receives the same launch configuration as a task. `AX_TASK_YAML` carries the `Task` with status omitted, so `spec.command` is included, and the container command is `/usr/local/bin/ax-task-runner`. Nothing in that environment marks the boot as golden. `runner.Run` has no golden-boot check: after workspace setup it starts `spec.command` whenever the command is nonempty. A runner you write sees the same inputs.
+
+The template sets `OnResume.FromData` to `RESUME_SOURCE_GOLDEN`, and a task's pause and commit snapshots cover durable data only. A resume restores the golden snapshot's process state together with the actor's own `/workspace` data. It brings back the processes captured during preparation rather than restarting the runner from the image, and it does not launch `spec.command` again.
+
+The snapshot is taken from that preparation boot, before the task actor is available, and it includes the command state at that moment. A run-once side effect that already fired, a command that already exited, or a command still in progress is what later resumes restore. Resume does not give that command a fresh start.
+
+Do not assume egress that a resumed task has while the snapshot is still being captured. The task actor is not available yet, so a job that needs the actor, its routing, or another path that appears only after resume can fail in this window. In the reported setup a network-dependent job failed then, and the failed command state was what later resumes restored. That followed from running the job during golden preparation. It does not mean Agent Substrate denies networking on a golden boot.
+
+One reported workaround keeps the real work behind an application-owned go file. `spec.command` waits until the file exists, and an external wrapper writes it through `ax ssh` after the task has resumed. `ax ssh` requires `spec.debug: true`. The file has to stay absent throughout golden preparation. If it is present, the command proceeds and the snapshot records that progress. Keep the HTTP server responsive while the command waits, and keep `/readyz` returning `200` once the workspace is prepared. Readiness must not wait for the go file: Substrate captures the golden snapshot after the readiness probe succeeds. The file is an application convention. It is not an AX lifecycle signal, and the wait is not an exactly-once guarantee. A later resume restores the golden processes, still waiting when that is the state the snapshot captured, together with the actor's durable files. A go file left on the durable volume can still be present, so the restored command can proceed again. AX does not clear the file, and a resume does not start a new command.
 
 ## What a runner must do
 
@@ -36,9 +50,9 @@ The `/workspace` volume is what survives suspend and resume. Agent Substrate sna
 | `/metadata/v1alpha1/ax/task` | Return the `Task` as `application/yaml`. Optional, but your command and `ax` tooling may expect it. |
 | `/metadata/v1alpha1/ax/workspaces` | Return every bound `Workspace` as a multi-document YAML stream. Optional, as above. |
 
-**Prepare each workspace once.** A task binds workspaces through `spec.workspaces`. For each binding, at its path, clone the Git repos from `spec.git`, create the skills path, write any MCP configuration, and run any environment bootstrap the binding asks for through its `goal`. A binding without a path lands at `/workspace/<name>`. Record that setup happened somewhere on the durable volume or in a known location, per workspace, then skip the work on later boots. Resume restarts the container, and re-cloning into a restored workspace would destroy the agent's state. The default runner writes a marker file under `/ax` for each workspace path.
+**Prepare each workspace once.** A task binds workspaces through `spec.workspaces`. For each binding, at its path, clone the Git repos from `spec.git`, create the skills path, write any MCP configuration, and run any environment bootstrap the binding asks for through its `goal`. A binding without a path lands at `/workspace/<name>`. Record that setup happened somewhere on the durable volume or in a known location, per workspace, then skip the work on later boots. A process restart runs the runner again against the restored workspace, and re-cloning into it would destroy the agent's state. The default runner writes a marker file under `/ax` for each workspace path.
 
-**Run the command and supervise it.** Start `spec.command` as a child process with the first workspace as its working directory. Give it `AX_METADATA_URL` pointing at your own HTTP server plus every `spec.env` entry. Put it in its own process group so you can signal everything it spawns.
+**Run the command and supervise it.** Start `spec.command` as a child process with the first workspace as its working directory. Give it `AX_METADATA_URL` pointing at your own HTTP server plus every `spec.env` entry. Put it in its own process group so you can signal everything it spawns. This start also runs during [golden boot](#golden-boot), before a task actor has resumed. A resume restores the process state captured there instead of launching the command again.
 
 **Stay up after the command exits.** The runner is PID 1, and the container lives as long as it does. If the runner exits when the command does, the metadata server goes with it and `ax ssh` stops working. Log the exit status and keep serving until you are told to stop. The control plane does not currently read the command's exit status back from the container.
 
