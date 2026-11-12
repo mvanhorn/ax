@@ -66,10 +66,18 @@ jobs:
 
     - name: Collect cluster diagnostics on failure
       if: failure()
+      timeout-minutes: 5
       env:
         KUBECONFIG: .tmp/kubeconfig-ax-e2e
       run: |
         [[ -f "${KUBECONFIG}" ]] || exit 0
-        kubectl get pods -A -o wide || true
-        kubectl -n ax-system logs deployment/ax-server --tail=200 || true
-        kubectl -n ate-system logs deployment/ate-api-server --all-containers --tail=200 || true
+        kubectl --request-timeout=15s get pods -A -o wide || true
+        for namespace in ate-system ax-system; do
+          pods=$(kubectl --request-timeout=15s -n "$namespace" get pods -o name) || continue
+          for pod in $pods; do
+            echo "::group::Logs for $namespace/$pod"
+            timeout 30s kubectl --request-timeout=15s -n "$namespace" logs "$pod" \
+              --all-containers --prefix --tail=200 --pod-running-timeout=10s || true
+            echo "::endgroup::"
+          done
+        done

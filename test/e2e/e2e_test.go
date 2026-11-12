@@ -17,6 +17,8 @@ package e2e_test
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -45,6 +47,33 @@ const (
 	metadataURL = "http://127.0.0.1:8099"
 )
 
+// TestE2E_ResumeCapacityRetry exercises the real command path with a local CLI
+// fixture, without changing the shared suite environment.
+func TestE2E_ResumeCapacityRetry(t *testing.T) {
+	dir := t.TempDir()
+	s := &suiteEnv{AXBin: filepath.Join(dir, "ax"), axHome: dir}
+	script := `#!/bin/sh
+if [ ! -f "$AX_HOME/attempted" ]; then
+    touch "$AX_HOME/attempted"
+    echo 'rpc error: code = Internal desc = resume actor: rpc error: code = ResourceExhausted desc = no worker has room for the actor'
+    exit 1
+fi
+echo resumed
+`
+	if err := os.WriteFile(s.AXBin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	out, err := s.runAX(ctx, defaultAtespace, "resume", "task", "test")
+	if err != nil {
+		t.Fatalf("resume failed: %v\nOutput:\n%s", err, out)
+	}
+	if strings.TrimSpace(out) != "resumed" {
+		t.Fatalf("resume output = %q, want resumed", out)
+	}
+}
+
 // TestE2E_CLIVersionAndAutoTunnel verifies `ax version` and that, without
 // --server, the CLI automatically opens a port-forward tunnel to ax-server
 // that `ax ctx` reports as healthy and `ax tunnel stop` tears down.
@@ -57,7 +86,7 @@ func TestE2E_CLIVersionAndAutoTunnel(t *testing.T) {
 	axHome := t.TempDir()
 	runTunneled := func(args ...string) string {
 		t.Helper()
-		cmd, cancel := env.axCommand(axHome, append([]string{"--context", env.KubeContext, "-n", env.AXSystemNamespace}, args...)...)
+		cmd, cancel := env.axCommand(t.Context(), axHome, append([]string{"--context", env.KubeContext, "-n", env.AXSystemNamespace}, args...)...)
 		defer cancel()
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -66,7 +95,8 @@ func TestE2E_CLIVersionAndAutoTunnel(t *testing.T) {
 		return string(out)
 	}
 	t.Cleanup(func() {
-		cmd, cancel := env.axCommand(axHome, "tunnel", "stop", env.KubeContext)
+		// axCommand supplies a timeout independent of the canceled test context.
+		cmd, cancel := env.axCommand(context.Background(), axHome, "tunnel", "stop", env.KubeContext)
 		defer cancel()
 		_ = cmd.Run()
 	})
@@ -258,7 +288,7 @@ func TestE2E_TaskLifecycleAndSubstrateSync(t *testing.T) {
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("duplicate CreateTask: got %v, want FailedPrecondition", err)
 	}
-	out, err := env.runAX(ns, "apply", "-f", writeManifest(t, manifest))
+	out, err := env.runAX(t.Context(), ns, "apply", "-f", writeManifest(t, manifest))
 	if err == nil {
 		t.Fatalf("expected re-applying an existing task to fail, got:\n%s", out)
 	}
@@ -364,7 +394,7 @@ func TestE2E_MetadataServerAndGuestExec(t *testing.T) {
 
 	// spec.command runs in the background after setup; wait for its output.
 	err := poll(10*time.Second, 250*time.Millisecond, func() error {
-		out, err := env.runAX(ns, "ssh", task, "--", "cat", "/workspace/cmd-ran.txt")
+		out, err := env.runAX(t.Context(), ns, "ssh", task, "--", "cat", "/workspace/cmd-ran.txt")
 		if err != nil {
 			return fmt.Errorf("%w: %s", err, out)
 		}
@@ -392,7 +422,7 @@ func TestE2E_MetadataServerAndGuestExec(t *testing.T) {
 	assertContains(t, "workspace metadata", curl(metadataURL+"/metadata/v1alpha1/ax/workspace"), ws, "hello from workspace")
 
 	// 3. `ax ssh` propagates a non-zero guest exit code.
-	if _, err := env.runAX(ns, "ssh", task, "--", "sh", "-c", "exit 17"); err == nil {
+	if _, err := env.runAX(t.Context(), ns, "ssh", task, "--", "sh", "-c", "exit 17"); err == nil {
 		t.Fatal("expected 'ax ssh' to fail when the guest command exits 17")
 	}
 
@@ -401,7 +431,7 @@ func TestE2E_MetadataServerAndGuestExec(t *testing.T) {
 	env.deleteOnCleanup(t, ns, "task", noDebug)
 	env.apply(t, ns, taskManifest(t, ns, noDebug, false))
 	env.mustRunAX(t, ns, "resume", "task", noDebug)
-	out, err = env.runAX(ns, "ssh", noDebug, "--", "echo", "should-fail")
+	out, err = env.runAX(t.Context(), ns, "ssh", noDebug, "--", "echo", "should-fail")
 	if err == nil {
 		t.Fatalf("expected 'ax ssh' to fail when debug=false, got:\n%s", out)
 	}

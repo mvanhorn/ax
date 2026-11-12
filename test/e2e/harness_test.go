@@ -336,8 +336,8 @@ func poll(timeout, interval time.Duration, fn func() error) error {
 // axCommand returns an `ax` invocation whose environment points at the E2E
 // cluster, with AX_SERVER and AX_HOME scrubbed so the caller's shell does not
 // leak in. The command is killed after axCommandTimeout.
-func (s *suiteEnv) axCommand(axHome string, args ...string) (*exec.Cmd, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(context.Background(), axCommandTimeout)
+func (s *suiteEnv) axCommand(ctx context.Context, axHome string, args ...string) (*exec.Cmd, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(ctx, axCommandTimeout)
 	cmd := exec.CommandContext(ctx, s.AXBin, args...)
 	for _, kv := range os.Environ() {
 		switch k, _, _ := strings.Cut(kv, "="); k {
@@ -352,20 +352,45 @@ func (s *suiteEnv) axCommand(axHome string, args ...string) (*exec.Cmd, context.
 
 // runAX runs `ax --server <url> --context <context> [-a atespace] args...` and returns its
 // combined output.
-func (s *suiteEnv) runAX(atespace string, args ...string) (string, error) {
+func (s *suiteEnv) runAX(ctx context.Context, atespace string, args ...string) (string, error) {
 	fullArgs := []string{"--server", s.AXServerURL, "--context", s.KubeContext}
 	if atespace != "" {
 		fullArgs = append(fullArgs, "-a", atespace)
 	}
-	cmd, cancel := s.axCommand(s.axHome, append(fullArgs, args...)...)
-	defer cancel()
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	resume := len(args) >= 2 && args[0] == "resume" && args[1] == "task"
+	if resume {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 3*time.Minute)
+		defer cancel()
+	}
+	for {
+		cmd, cancel := s.axCommand(ctx, s.axHome, append(fullArgs, args...)...)
+		out, err := cmd.CombinedOutput()
+		cancel()
+		if err == nil {
+			return string(out), nil
+		}
+		if ctx.Err() != nil {
+			return string(out), fmt.Errorf("ax command stopped: %w (last command error: %w)", ctx.Err(), err)
+		}
+		// recordFailure wraps the Substrate capacity error in an outer Internal status.
+		if !resume || !strings.Contains(string(out), "code = ResourceExhausted") ||
+			!strings.Contains(string(out), "no worker has room for the actor") {
+			return string(out), err
+		}
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return string(out), fmt.Errorf("waiting for resume capacity: %w (last command error: %w)", ctx.Err(), err)
+		case <-timer.C:
+		}
+	}
 }
 
 func (s *suiteEnv) mustRunAX(t *testing.T, atespace string, args ...string) string {
 	t.Helper()
-	out, err := s.runAX(atespace, args...)
+	out, err := s.runAX(t.Context(), atespace, args...)
 	if err != nil {
 		t.Fatalf("ax %s failed: %v\nOutput:\n%s", strings.Join(args, " "), err, out)
 	}
@@ -398,7 +423,10 @@ func (s *suiteEnv) apply(t *testing.T, atespace, manifest string) string {
 // when the test finishes. Resources are deleted in reverse registration order.
 func (s *suiteEnv) deleteOnCleanup(t *testing.T, atespace, kind, name string) {
 	t.Cleanup(func() {
-		if out, err := s.runAX(atespace, "delete", kind, name); err != nil && !strings.Contains(out, "NotFound") {
+		// The test context is already canceled when cleanup runs.
+		ctx, cancel := context.WithTimeout(context.Background(), axCommandTimeout)
+		defer cancel()
+		if out, err := s.runAX(ctx, atespace, "delete", kind, name); err != nil && !strings.Contains(out, "NotFound") {
 			t.Logf("cleanup: ax delete %s %s: %v\n%s", kind, name, err, out)
 		}
 	})
